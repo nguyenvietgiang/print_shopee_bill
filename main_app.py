@@ -5,7 +5,7 @@ GUI: PySide6 (Qt for Python) — 4-tab layout with QSS stylesheet (SaaS Light Th
 Chạy: python main_app.py
 Đóng gói .exe: pyinstaller TTS_Bill.spec
 """
-import os, sys, json, shutil, threading, re as _re
+import os, sys, json, shutil, threading, time, re as _re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -163,6 +163,9 @@ def _detect_captcha(page, log_cb, state_cb, stop_event):
                 return
         except Exception:
             continue
+
+FAILED_BATCHES = []  # các batch không lấy được PDF — worker đọc để báo lỗi
+
 
 def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_event=None,
                    existing_playwright=None, existing_browser=None, carrier=None, test_mode=False,
@@ -600,6 +603,37 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
             # ── 10. Create documents + network interception ──
             new_page_ref = []
             downloaded_files = []
+            pdf_urls = []
+
+            def _refetch_pdf(url):
+                for _try in range(3):
+                    try:
+                        r = context.request.get(url, timeout=120000)
+                        if r.ok:
+                            b = r.body()
+                            if b and len(b) > 5000: return b
+                    except Exception as e:
+                        log_cb(f'  ⚠ Tải lại PDF lần {_try+1}/3 lỗi: {e}', 'warn')
+                    time.sleep(2)
+                return None
+
+            def _save_awb_body(body):
+                """Lưu + kiểm tra PDF là phiếu Shopee thật (không phải trang xem trước)."""
+                if not body or len(body) <= 5000 or downloaded_files: return False
+                bp = str(Path(output_dir) / f'Shopee_{carrier or "all"}_batch{batch_num}_{datetime.now().strftime("%m-%d_%H-%M-%S")}.pdf')
+                with open(bp, 'wb') as f: f.write(body)
+                try:
+                    kind = _get_calculator()[3](bp)
+                except Exception:
+                    kind = 'shopee'
+                if kind != 'shopee':
+                    log_cb(f'  ⚠ PDF tải về không phải phiếu Shopee ({kind}) — loại bỏ', 'warn')
+                    try: os.remove(bp)
+                    except Exception: pass
+                    return False
+                downloaded_files.append(bp)
+                log_cb(f'  💾 Network PDF: {Path(bp).name} ({len(body)//1024}KB)', 'ok')
+                return True
 
             def _awb_on_new_page(p):
                 log_cb(f'  🔔 Tab awbprint: {p.url[:120] if p.url else "(loading)"}', 'dim')
@@ -609,15 +643,14 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                     ct = (response.headers.get('content-type', '') or '').lower()
                     url_lower = (response.url or '').lower()
                     if (('application/pdf' in ct or 'application/force-download' in ct or url_lower.endswith('.pdf') or 'download_sd_job' in url_lower) and response.ok):
+                        pdf_urls.append(response.url)
                         try:
                             body = response.body()
-                            if body and len(body) > 5000:
-                                bp = str(Path(output_dir) / f'Shopee_{carrier or "all"}_batch{batch_num}_{datetime.now().strftime("%m-%d_%H-%M-%S")}.pdf')
-                                with open(bp, 'wb') as f: f.write(body)
-                                downloaded_files.append(bp)
-                                log_cb(f'  💾 Network PDF: {Path(bp).name} ({len(body)//1024}KB)', 'ok')
                         except Exception as e:
-                            log_cb(f'  ⚠ Response body error: {e}', 'warn')
+                            # PDF lớn (200 đơn) bị Chrome đẩy khỏi inspector cache → tải lại trực tiếp bằng cookie của context
+                            log_cb(f'  ⚠ Response body error: {e} — tải lại trực tiếp từ URL...', 'warn')
+                            body = _refetch_pdf(response.url)
+                        _save_awb_body(body)
                 p.on('response', _on_response)
                 def _awb_dl(dl):
                     if downloaded_files: return
@@ -665,8 +698,13 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                 continue
 
             log_cb('  ⏳ Đợi tab awbprint + PDF (tối đa 120 giây)...', 'dim')
+            _in_clicks = 0
             for _wait_i in range(60):
                 if downloaded_files: break
+                if pdf_urls and not downloaded_files and _wait_i >= 5:
+                    # Đã thấy URL PDF nhưng chưa lưu được → tải lại trực tiếp
+                    for _u in list(pdf_urls):
+                        if _save_awb_body(_refetch_pdf(_u)): break
                 if stop_event and stop_event.is_set():
                     log_cb('  ⏹ Đã dừng theo yêu cầu', 'warn')
                     try: context.remove_listener('page', _awb_on_new_page)
@@ -684,7 +722,8 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                             if _wait_i == 5:
                                 try: awb_page.wait_for_load_state('networkidle', timeout=30000)
                                 except Exception: pass
-                            if _wait_i >= 10 and not downloaded_files:
+                            if _wait_i >= 10 and not downloaded_files and _wait_i % 10 == 0 and _in_clicks < 3:
+                                _in_clicks += 1
                                 for btn_text in ['In', 'In phiếu', 'Print', 'Tải về', 'Download', 'Lưu']:
                                     try:
                                         btn = awb_page.locator(f'button:has-text("{btn_text}")').first
@@ -702,24 +741,23 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
             if downloaded_files:
                 log_cb(f'  ✅ Đã lấy {len(downloaded_files)} file PDF', 'ok')
             else:
-                log_cb('  ⚠ Network không bắt được PDF — thử page.pdf()...', 'warn')
+                log_cb('  ⚠ Network không bắt được PDF — thử tải lại trực tiếp từ URL...', 'warn')
                 try:
                     ss = str(Path(output_dir) / f'debug_no_dl_{carrier or "all"}_batch{batch_num}.png')
                     page.screenshot(path=ss)
                     log_cb(f'  📸 Screenshot: {ss}', 'dim')
                 except Exception: pass
-                awb_page = new_page_ref[0] if new_page_ref else None
-                if awb_page and not awb_page.is_closed():
-                    try: awb_page.wait_for_load_state('networkidle', timeout=15000)
-                    except Exception: pass
-                    awb_page.wait_for_timeout(5000)
+                urls = list(pdf_urls)
+                for p in new_page_ref:
                     try:
-                        save_path = str(Path(output_dir) / f'Shopee_{carrier or "all"}_batch{batch_num}_{datetime.now().strftime("%m-%d_%H-%M-%S")}.pdf')
-                        awb_page.pdf(path=save_path)
-                        downloaded_files.append(save_path)
-                        log_cb(f'  💾 page.pdf(): {Path(save_path).name}', 'ok')
-                    except Exception as e2:
-                        log_cb(f'  ⚠ Không lưu được PDF: {e2}', 'warn')
+                        if p.url and p.url.startswith('http'): urls.append(p.url)
+                    except Exception: pass
+                for u in urls:
+                    if _save_awb_body(_refetch_pdf(u)): break
+                # KHÔNG dùng page.pdf(): chỉ chụp trang xem trước, không phải phiếu thật → mất đơn âm thầm
+                if not downloaded_files:
+                    log_cb(f'  ❌ BATCH {batch_num} THẤT BẠI: không lấy được PDF ({locals().get("remaining", "?")} đơn CHƯA IN) — cần xử lý thủ công!', 'err')
+                    FAILED_BATCHES.append({'carrier': carrier, 'batch': batch_num, 'orders': locals().get('remaining', 0)})
 
             for p in new_page_ref:
                 try:
@@ -884,6 +922,12 @@ class AutomationWorker(QObject):
                     active = {k: v for k, v in scanned_counts.items() if v > 0}
                     self.log_message.emit('info', f'📊 Quét xong: {active if active else "(không có đơn nào)"}')
 
+                if FAILED_BATCHES:
+                    for fb in FAILED_BATCHES:
+                        self.log_message.emit('err', f'❌ CẢNH BÁO: [{fb["carrier"]}] batch {fb["batch"]} ({fb["orders"]} đơn) KHÔNG in được — phải in lại thủ công!')
+                    self.failed_batches_total = getattr(self, 'failed_batches_total', 0) + len(FAILED_BATCHES)
+                    FAILED_BATCHES.clear()
+
                 if pw2: pw = pw2
                 if br2: br = br2
                 self._playwright = pw
@@ -908,6 +952,12 @@ class AutomationWorker(QObject):
                             picking_path, shipping_path, _ = split_fn(p, out_dir)
                             if shipping_path:
                                 shipping_files.append((p, shipping_path))
+                            else:
+                                self.log_message.emit('err', f'❌ {Path(p).name}: không tách được phiếu gửi hàng — ĐƠN CHƯA IN!')
+                                self.failed_batches_total = getattr(self, 'failed_batches_total', 0) + 1
+                        else:
+                            self.log_message.emit('err', f'❌ {Path(p).name}: không nhận diện được là phiếu Shopee ({pdf_type}) — BỎ QUA, ĐƠN CHƯA IN!')
+                            self.failed_batches_total = getattr(self, 'failed_batches_total', 0) + 1
 
                     # ── Bước 2: In shipping label TRƯỚC ──
                     if auto_print and shipping_files:
@@ -961,8 +1011,14 @@ class AutomationWorker(QObject):
                 total_processed += count if count > 0 else 0
 
             # ── Tất cả carriers hoàn thành ──
-            self.log_message.emit('bold_ok', '🏁 HOÀN THÀNH!')
-            self.state_changed.emit('done', f'✅ Hoàn thành lúc {datetime.now().strftime("%H:%M:%S")}')
+            _nfail = getattr(self, 'failed_batches_total', 0)
+            self.failed_batches_total = 0
+            if _nfail:
+                self.log_message.emit('err', f'🏁 KẾT THÚC NHƯNG CÓ {_nfail} BATCH BỊ LỖI — KIỂM TRA LẠI ĐƠN CHƯA IN!')
+                self.state_changed.emit('error', f'⚠ {_nfail} batch lỗi, còn đơn chưa in!')
+            else:
+                self.log_message.emit('bold_ok', '🏁 HOÀN THÀNH!')
+                self.state_changed.emit('done', f'✅ Hoàn thành lúc {datetime.now().strftime("%H:%M:%S")}')
             try:
                 if br: br.close()
             except Exception: pass

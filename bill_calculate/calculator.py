@@ -287,6 +287,7 @@ def _parse_shopee_header(full_text: str) -> dict:
 
     # Đếm tổng số Order SN duy nhất từ picking list
     order_sns = set(re.findall(r'\b(\d{6}[A-Z0-9]{4,10})\b', full_text))
+    info['order_sns'] = sorted(order_sns)
     info['order_qty'] = len(order_sns)
     info['product_qty'] = len(order_sns)
     info['item_qty'] = len(order_sns)
@@ -312,6 +313,32 @@ def _extract_order_sns_from_shipping(shipping_pdf_path: str) -> list[str]:
     except Exception:
         pass
     return sorted(full_sns)
+
+
+def _extract_order_sns_from_picking(pdf_path: str) -> list[str]:
+    """
+    Trích Order SN từ cột Order SN (x >= ~500) của phiếu xuất hàng.
+    Dùng khi không có file shipping label đi kèm.
+    """
+    import pdfplumber
+    sn_pattern = re.compile(r'\b(\d{6}[A-Z0-9]{4,10})\b')
+    sns: set[str] = set()
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ''
+                if 'mã vận đơn' in text.lower() or 'THÔNG TIN ĐƠN HÀNG' in text:
+                    continue
+                rows: dict[int, list] = {}
+                for c in page.chars:
+                    if c['x0'] >= 500:
+                        rows.setdefault(round(c['top'] / 5) * 5, []).append(c)
+                for y in sorted(rows):
+                    line = ''.join(c['text'] for c in sorted(rows[y], key=lambda c2: c2['x0']))
+                    sns.update(sn_pattern.findall(line))
+    except Exception:
+        pass
+    return sorted(sns)
 
 
 def _extract_shopee_lines(pdf_path: str) -> list[dict]:
@@ -474,6 +501,11 @@ def extract_order_counts_shopee(
         for line in lines
     )
     header_info = _parse_shopee_header(full_text)
+
+    # full_text chỉ gồm cột SKU + Qty nên không có Order SN → đọc riêng từ cột Order SN
+    picking_sns = _extract_order_sns_from_picking(pdf_path)
+    if picking_sns:
+        header_info['order_sns'] = picking_sns
 
     counts: dict[str, int] = defaultdict(int)
 
