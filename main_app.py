@@ -41,6 +41,11 @@ BILL_DIR = BASE_DIR / 'bill_calculate'
 UPLOAD_DIR = BILL_DIR / 'uploads'
 sys.path.insert(0, str(BILL_DIR))
 
+# Config lưu ở thư mục cố định của user (không nằm cạnh exe) để build/giải nén bản mới
+# không làm mất các đường dẫn file đã chọn.
+CONFIG_DIR = Path(os.environ.get('APPDATA') or Path.home()) / 'ShopeePrint'
+CONFIG_FILE = CONFIG_DIR / '.shopee_config.json'
+
 # Lazy import: calculator modules sẽ được import trong run_calculator()
 # để tránh kéo pdfplumber + openpyxl + win32com (~6s) lúc khởi động
 
@@ -224,8 +229,35 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
         try:
             from playwright.sync_api import sync_playwright  # lazy import (~2.3s)
             playwright = sync_playwright().start()
-            launch_opts = {'headless': False, 'channel': 'chrome',
-                           'args': ['--disable-blink-features=AutomationControlled']}
+            # Các cờ an toàn để giảm tải nền và chống Chrome làm chậm tab khi cửa sổ bị che/ở nền
+            # (cùng bộ cờ với bản TikTok) — KHÔNG đụng tới GPU/renderer.
+            chrome_args = [
+                '--disable-blink-features=AutomationControlled',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-breakpad',
+                '--disable-client-side-phishing-detection',
+                '--disable-default-apps',
+                '--disable-hang-monitor',
+                '--disable-ipc-flooding-protection',
+                '--disable-popup-blocking',
+                '--disable-prompt-on-repost',
+                '--disable-renderer-backgrounding',
+                '--disable-sync',
+                '--metrics-recording-only',
+                '--no-first-run',
+                '--password-store=basic',
+                '--use-mock-keychain',
+                '--mute-audio',
+                '--disable-infobars',
+                '--no-default-browser-check',
+                '--no-pings',
+                '--safebrowsing-disable-auto-update',
+                '--disable-search-engine-choice-screen',
+            ]
+            launch_opts = {'headless': False, 'channel': 'chrome', 'args': chrome_args}
             log_cb('🌐 Dùng Google Chrome có sẵn trên máy', 'info')
             browser = playwright.chromium.launch(**launch_opts)
         except Exception as e:
@@ -1556,6 +1588,14 @@ class App(QMainWindow):
         self._apply_stylesheet()
         self._build_ui()
 
+        # ── Nạp cấu hình đã lưu từ lần trước ──
+        self._config_path = CONFIG_FILE
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        self._load_config()
+
         self._update_cookie_status()
         self._update_master_status()
         self._update_retail_status()
@@ -2821,23 +2861,28 @@ class App(QMainWindow):
     def _on_cookie_changed(self, path: str):
         self._cookie_real = path
         self._update_cookie_status()
+        self._save_config()
 
     def _on_master_changed(self, path: str):
         self._master_real = path
         self._update_master_status()
+        self._save_config()
         self._load_preview_data()
 
     def _on_retail_changed(self, path: str):
         self._retail_real = path
         self._update_retail_status()
+        self._save_config()
         self._load_preview_data()
 
     def _on_template_changed(self, path: str):
         self._template_real = path
         self._update_template_status()
+        self._save_config()
 
     def _on_output_dir_changed(self, path: str):
         os.makedirs(path, exist_ok=True)
+        self._save_config()
 
     # ═══════════════════════════════════════════════════════
     # PREVIEW TABLE LOGIC WITH SEARCH
@@ -3429,12 +3474,92 @@ class App(QMainWindow):
             self.status_label.setStyleSheet("color: #2563EB; font-weight: bold; font-size: 14px;")
 
     # ═══════════════════════════════════════════════════════
+    # CONFIG PERSISTENCE
+    # ═══════════════════════════════════════════════════════
+    def _save_config(self):
+        """Lưu cấu hình hiện tại ra file JSON."""
+        data = {
+            'cookie': self._cookie_real,
+            'master': self._master_real,
+            'retail': self._retail_real,
+            'template': self._template_real,
+            'output_dir': self.output_row.get_real_path(),
+            'carriers': {k: {
+                'checked': self.carrier_checkboxes[k].isChecked(),
+                'count': self.carrier_spinboxes[k].value(),
+            } for k in self.carrier_checkboxes},
+            'auto_print': self.auto_print_cb.isChecked(),
+            'printer': self.printer_combo.currentText(),
+            'duplex': self.duplex_combo.currentIndex(),
+            'batch_size': self.batch_size_spin.value(),
+            'exclude_pre_orders': self.exclude_pre_orders_cb.isChecked(),
+            'weekly_schedule': {str(idx): {
+                'checked': self.weekly_day_checkboxes[idx].isChecked(),
+                'times': self.weekly_day_time_edits[idx].text(),
+            } for idx in self.weekly_day_checkboxes},
+        }
+        try:
+            self._config_path.parent.mkdir(parents=True, exist_ok=True)
+            self._config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        except OSError:
+            pass
+
+    def _load_config(self):
+        """Nạp cấu hình từ file JSON (nếu có)."""
+        if not self._config_path.exists():
+            return
+        try:
+            data = json.loads(self._config_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            return
+
+        # Giữ nguyên đường dẫn đã lưu kể cả khi file đang không tồn tại (đã bị di chuyển/xóa):
+        # ô vẫn hiện đường dẫn cũ + trạng thái ❌ thay vì bị xóa trống.
+        for key, attr in [('cookie', '_cookie_real'), ('master', '_master_real'),
+                          ('retail', '_retail_real'), ('template', '_template_real')]:
+            saved = data.get(key, '')
+            if saved:
+                setattr(self, attr, saved)
+        self.cookie_row.set_path(self._cookie_real)
+        self.master_row.set_path(self._master_real)
+        self.retail_row.set_path(self._retail_real)
+        self.template_row.set_path(self._template_real)
+
+        saved_out = data.get('output_dir', '')
+        if saved_out:
+            self.output_row.set_path(saved_out)
+            self.output_row._update_status_dir()
+
+        for k, v in data.get('carriers', {}).items():
+            if k in self.carrier_checkboxes:
+                self.carrier_checkboxes[k].setChecked(v.get('checked', True))
+                self.carrier_spinboxes[k].setValue(v.get('count', 0))
+
+        self.auto_print_cb.setChecked(data.get('auto_print', False))
+        saved_printer = data.get('printer', '')
+        if saved_printer:
+            idx = self.printer_combo.findText(saved_printer)
+            if idx >= 0: self.printer_combo.setCurrentIndex(idx)
+        idx_duplex = data.get('duplex', -1)
+        if 0 <= idx_duplex < self.duplex_combo.count():
+            self.duplex_combo.setCurrentIndex(idx_duplex)
+        self.batch_size_spin.setValue(data.get('batch_size', 0))
+        self.exclude_pre_orders_cb.setChecked(data.get('exclude_pre_orders', True))
+
+        for idx_str, day_data in data.get('weekly_schedule', {}).items():
+            idx = int(idx_str)
+            if idx in self.weekly_day_checkboxes:
+                self.weekly_day_checkboxes[idx].setChecked(day_data.get('checked', idx < 6))
+                self.weekly_day_time_edits[idx].setText(day_data.get('times', ''))
+
+    # ═══════════════════════════════════════════════════════
     # CLOSE EVENT
     # ═══════════════════════════════════════════════════════
     def closeEvent(self, event):
         self.scheduler_active = False
         self._sched_timer.stop()
         self.running = False
+        self._save_config()
         # shutdown() chứa browser.close() + playwright.stop() là process-level, không phụ thuộc thread
         # Gọi trực tiếp là an toàn; invokeMethod + BlockingQueuedConnection có thể deadlock nếu worker đang bận
         self._worker.shutdown()
