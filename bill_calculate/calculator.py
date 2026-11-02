@@ -1443,6 +1443,17 @@ def process_all(
             else:
                 calc_path = pdf_path
                 shipping_pages = 0
+                # File đã được tách từ trước (X_phieu_xuat.pdf) → tìm shipping label đi kèm
+                # để lấy Order SN đầy đủ gửi API (picking list chỉ có SN thiếu/rỗng)
+                if pdf_path.lower().endswith('_phieu_xuat.pdf'):
+                    sibling = pdf_path[:-len('_phieu_xuat.pdf')] + '_shipping_label.pdf'
+                    if os.path.exists(sibling):
+                        shipping_path = sibling
+                        try:
+                            from pypdf import PdfReader
+                            shipping_pages = len(PdfReader(sibling).pages)
+                        except Exception:
+                            shipping_pages = 0
 
             if shipping_path:
                 print(f"   → File shipping label: {os.path.basename(shipping_path)}")
@@ -1470,6 +1481,8 @@ def process_all(
             all_order_sns.update(full_sns)
         elif header_info.get('order_sns'):
             # Fallback: lấy từ picking list (có thể thiếu vài ký tự cuối)
+            print(f"   ⚠ Không có shipping label → Order SN lấy từ picking list, có thể thiếu/sai. "
+                  f"Hãy chọn file GỘP (phiếu xuất + shipping label) để gửi API đủ ID.")
             all_order_sns.update(header_info['order_sns'])
         print(f"   Tim thay {len(order_counts)} Seller SKU, {order_qty} don hang (header), {sum(order_counts.values())} mat hang")
 

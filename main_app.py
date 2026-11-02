@@ -697,18 +697,41 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
 
             context.on('page', _awb_on_new_page)
 
-            create_clicked = False
-            for btn_text in ['Tạo phiếu đã chọn', 'Tạo phiếu', 'Tạo']:
+            def _awb_page_failed(awb_page):
+                """True nếu tab awbprint đang hiện trang lỗi 'Failed to Load Shipping Documents' của Shopee."""
                 try:
-                    btn = page.locator(f'button:has-text("{btn_text}")').first
-                    if btn.count() > 0 and btn.is_visible(timeout=2000):
-                        btn.click(force=True, timeout=5000)
-                        log_cb(f'  ✓ Đã bấm "{btn_text}"', 'dim')
-                        create_clicked = True
-                        break
+                    if awb_page.is_closed(): return False
+                    if awb_page.get_by_text('Failed to Load Shipping Documents').first.is_visible(timeout=300):
+                        return True
+                    if awb_page.get_by_text('Failed to Load', exact=False).first.is_visible(timeout=300):
+                        return True
+                    if 'awbprint' in (awb_page.url or '') and awb_page.get_by_role('button', name='Đóng trang').first.is_visible(timeout=300):
+                        return True
                 except Exception:
                     pass
-            if not create_clicked:
+                return False
+
+            def _close_awb_tabs():
+                """Bấm 'Đóng trang' (nếu có) rồi đóng hẳn các tab awbprint."""
+                for p in list(new_page_ref):
+                    try:
+                        if p.is_closed(): continue
+                        try: p.get_by_role('button', name='Đóng trang').first.click(timeout=1500)
+                        except Exception: pass
+                        if not p.is_closed(): p.close()
+                    except Exception: pass
+                new_page_ref.clear()
+
+            def _click_create():
+                for btn_text in ['Tạo phiếu đã chọn', 'Tạo phiếu', 'Tạo']:
+                    try:
+                        btn = page.locator(f'button:has-text("{btn_text}")').first
+                        if btn.count() > 0 and btn.is_visible(timeout=2000):
+                            btn.click(force=True, timeout=5000)
+                            log_cb(f'  ✓ Đã bấm "{btn_text}"', 'dim')
+                            return True
+                    except Exception:
+                        pass
                 try:
                     clicked = page.evaluate('''() => {
                         const btns = document.querySelectorAll('button');
@@ -720,55 +743,77 @@ def run_automation(cookie_path, output_dir, max_orders, log_cb, state_cb, stop_e
                     }''')
                     if clicked:
                         log_cb(f'  ✓ Fallback: đã bấm "{clicked}"', 'dim')
-                        create_clicked = True
+                        return True
                 except Exception:
                     pass
-            if not create_clicked:
-                log_cb('  ⚠ Không tìm thấy nút "Tạo phiếu đã chọn"', 'warn')
-                try: context.remove_listener('page', _awb_on_new_page)
-                except Exception: pass
-                continue
+                return False
 
-            log_cb('  ⏳ Đợi tab awbprint + PDF (tối đa 120 giây)...', 'dim')
-            _in_clicks = 0
-            for _wait_i in range(60):
-                if downloaded_files: break
-                if pdf_urls and not downloaded_files and _wait_i >= 5:
-                    # Đã thấy URL PDF nhưng chưa lưu được → tải lại trực tiếp
-                    for _u in list(pdf_urls):
-                        if _save_awb_body(_refetch_pdf(_u)): break
-                if stop_event and stop_event.is_set():
-                    log_cb('  ⏹ Đã dừng theo yêu cầu', 'warn')
-                    try: context.remove_listener('page', _awb_on_new_page)
-                    except Exception: pass
-                    return all_batch_pdfs if all_batch_pdfs else pdf_files, playwright, browser, carrier_counts
-                if not new_page_ref:
-                    for p in context.pages:
-                        if p != page and not p.is_closed():
-                            _awb_on_new_page(p)
-                            break
-                if new_page_ref:
-                    awb_page = new_page_ref[0]
-                    if not awb_page.is_closed():
-                        try:
-                            if _wait_i == 5:
-                                try: awb_page.wait_for_load_state('networkidle', timeout=30000)
-                                except Exception: pass
-                            if _wait_i >= 10 and not downloaded_files and _wait_i % 10 == 0 and _in_clicks < 3:
-                                _in_clicks += 1
-                                for btn_text in ['In', 'In phiếu', 'Print', 'Tải về', 'Download', 'Lưu']:
-                                    try:
-                                        btn = awb_page.locator(f'button:has-text("{btn_text}")').first
-                                        if btn.count() > 0 and btn.is_visible(timeout=500):
-                                            btn.click(force=True, timeout=3000)
-                                            log_cb(f'  ✓ Đã bấm "{btn_text}" trên tab awbprint', 'dim')
-                                            break
+            def _wait_awb():
+                """Đợi tab awbprint + PDF. Trả về 'ok' | 'stopped' | 'failed' (Shopee lỗi tải phiếu) | 'timeout'."""
+                _in_clicks = 0
+                for _wait_i in range(60):
+                    if downloaded_files: return 'ok'
+                    if pdf_urls and not downloaded_files and _wait_i >= 5:
+                        # Đã thấy URL PDF nhưng chưa lưu được → tải lại trực tiếp
+                        for _u in list(pdf_urls):
+                            if _save_awb_body(_refetch_pdf(_u)): break
+                    if stop_event and stop_event.is_set():
+                        return 'stopped'
+                    if not new_page_ref:
+                        for p in context.pages:
+                            if p != page and not p.is_closed():
+                                _awb_on_new_page(p)
+                                break
+                    if new_page_ref:
+                        awb_page = new_page_ref[0]
+                        if not awb_page.is_closed():
+                            if not downloaded_files and _awb_page_failed(awb_page):
+                                return 'failed'
+                            try:
+                                if _wait_i == 5:
+                                    try: awb_page.wait_for_load_state('networkidle', timeout=30000)
                                     except Exception: pass
-                        except Exception: pass
-                page.wait_for_timeout(2000)
+                                if _wait_i >= 10 and not downloaded_files and _wait_i % 10 == 0 and _in_clicks < 3:
+                                    _in_clicks += 1
+                                    for btn_text in ['In', 'In phiếu', 'Print', 'Tải về', 'Download', 'Lưu']:
+                                        try:
+                                            btn = awb_page.locator(f'button:has-text("{btn_text}")').first
+                                            if btn.count() > 0 and btn.is_visible(timeout=500):
+                                                btn.click(force=True, timeout=3000)
+                                                log_cb(f'  ✓ Đã bấm "{btn_text}" trên tab awbprint', 'dim')
+                                                break
+                                        except Exception: pass
+                            except Exception: pass
+                    page.wait_for_timeout(2000)
+                return 'ok' if downloaded_files else 'timeout'
+
+            MAX_AWB_RETRIES = 3
+            create_clicked = False
+            awb_result = 'timeout'
+            for _awb_try in range(1, MAX_AWB_RETRIES + 1):
+                if _awb_try > 1:
+                    log_cb(f'  🔄 Tạo lại phiếu (lần {_awb_try}/{MAX_AWB_RETRIES})...', 'warn')
+                    page.wait_for_timeout(3000)
+                    pdf_urls.clear()
+                create_clicked = _click_create()
+                if not create_clicked:
+                    break
+                log_cb('  ⏳ Đợi tab awbprint + PDF (tối đa 120 giây)...', 'dim')
+                awb_result = _wait_awb()
+                if awb_result != 'failed':
+                    break
+                log_cb(f'  ⚠ Shopee báo "Failed to Load Shipping Documents" (lần {_awb_try}/{MAX_AWB_RETRIES}) — đóng trang và thử lại', 'warn')
+                _close_awb_tabs()
 
             try: context.remove_listener('page', _awb_on_new_page)
             except Exception: pass
+
+            if awb_result == 'stopped':
+                log_cb('  ⏹ Đã dừng theo yêu cầu', 'warn')
+                return all_batch_pdfs if all_batch_pdfs else pdf_files, playwright, browser, carrier_counts
+            if not create_clicked and _awb_try == 1:
+                log_cb('  ⚠ Không tìm thấy nút "Tạo phiếu đã chọn"', 'warn')
+                continue
 
             if downloaded_files:
                 log_cb(f'  ✅ Đã lấy {len(downloaded_files)} file PDF', 'ok')
@@ -2569,14 +2614,7 @@ class App(QMainWindow):
                     except Exception as e:
                         self._test_log.emit("err", f"  ✗ Lỗi in {Path(fp).name}: {e}")
 
-            # ── Dọn file shipping label trung gian đã tách ──
-            for fp in shipping_files:
-                if fp not in all_files and Path(fp).exists():
-                    try:
-                        Path(fp).unlink()
-                        self._test_log.emit("dim", f"  🗑 Đã dọn: {Path(fp).name}")
-                    except Exception:
-                        pass
+            # (Chưa dọn shipping label ở đây: bước 3 cần đọc Order SN đầy đủ từ file này để gửi API)
 
             # ── Bước 3: Tính toán + in báo cáo ──
             if picking_files:
@@ -2604,8 +2642,8 @@ class App(QMainWindow):
                 except Exception as e:
                     self._test_log.emit("err", f"  ✗ Lỗi tính toán: {e}")
 
-            # ── Dọn file phiếu xuất trung gian đã tách ──
-            for fp in picking_files:
+            # ── Dọn file shipping label + phiếu xuất trung gian đã tách ──
+            for fp in shipping_files + picking_files:
                 if fp not in all_files and Path(fp).exists():
                     try:
                         Path(fp).unlink()
