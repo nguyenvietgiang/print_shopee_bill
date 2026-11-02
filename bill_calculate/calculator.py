@@ -506,6 +506,10 @@ def extract_order_counts_shopee(
     picking_sns = _extract_order_sns_from_picking(pdf_path)
     if picking_sns:
         header_info['order_sns'] = picking_sns
+        # _parse_shopee_header không thấy Order SN (full_text thiếu cột đó) → order_qty = 0
+        header_info['order_qty'] = len(picking_sns)
+        header_info['product_qty'] = len(picking_sns)
+        header_info['item_qty'] = len(picking_sns)
 
     counts: dict[str, int] = defaultdict(int)
 
@@ -1502,6 +1506,10 @@ def process_all(
     carrier_safe = carrier.replace(' ', '_').replace('&', 'n') if carrier else ''
     prefix = f"Phieu_xuat_hang_{carrier_safe}_" if carrier_safe else "Phieu_xuat_hang_"
     output_path = os.path.join(output_dir, f"{prefix}{now.strftime('%m-%d_%H-%M-%S')}.xlsx")
+
+    # Dự phòng: nếu không đọc được số đơn thì dùng số Order SN đã gom được
+    if total_order_qty <= 0 and all_order_sns:
+        total_order_qty = len(all_order_sns)
 
     fill_template(results, template_path, output_path, carrier=carrier, order_count=total_order_qty, source_label='Shopee')
 
