@@ -41,3 +41,6 @@ package-lock.json
 
 # ── File cũ không dùng nữa ──
 bill_calculate/app.py
+
+# ── File sao lưu cục bộ ──
+*.bak
