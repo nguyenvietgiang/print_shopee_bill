@@ -63,7 +63,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='TTS_Bill',
+    name='shopeebot',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
