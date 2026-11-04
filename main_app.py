@@ -1042,11 +1042,16 @@ class AutomationWorker(QObject):
                         for orig_p, shipping_f in shipping_files:
                             if Path(shipping_f).exists():
                                 try:
-                                    _print_file(str(shipping_f), printer, pdf_settings=pdf_settings, batch_size=batch_size,
-                                                log_cb=lambda m, t='': self.log_message.emit(t, m))
-                                    self.log_message.emit('ok', f'  ✓ Đã gửi in: {Path(shipping_f).name}')
+                                    st = _print_file(str(shipping_f), printer, pdf_settings=pdf_settings, batch_size=batch_size,
+                                                     log_cb=lambda m, t='': self.log_message.emit(t, m),
+                                                     stop_event=self._stop_event)
+                                    if st == 'unverified':
+                                        self.unverified_prints = getattr(self, 'unverified_prints', 0) + 1
+                                        self.log_message.emit('warn', f'  ⚠ Đã gửi in nhưng chưa xác nhận được: {Path(shipping_f).name} — kiểm tra giấy ra')
+                                    else:
+                                        self.log_message.emit('ok', f'  ✓ Đã in xong: {Path(shipping_f).name}')
                                 except Exception as e:
-                                    self.log_message.emit('err', f'  ✗ Lỗi in {Path(shipping_f).name}: {e}')
+                                    self._record_print_failure(shipping_f, out_dir, e, keep_copy=True)
 
                     # ── Bước 3: Tính bill ──
                     self.log_message.emit('info', f'📊 Đang tính bill [{carrier_display}]...')
@@ -1078,10 +1083,11 @@ class AutomationWorker(QObject):
                             try:
                                 self.log_message.emit('info', f'  🖨️ In báo cáo: {Path(fp).name}')
                                 _print_file(fp, printer, pdf_settings=pdf_settings, batch_size=batch_size,
-                                            log_cb=lambda m, t='': self.log_message.emit(t, m))
+                                            log_cb=lambda m, t='': self.log_message.emit(t, m),
+                                            stop_event=self._stop_event)
                                 self.log_message.emit('ok', f'  ✓ Đã in báo cáo: {Path(fp).name}')
                             except Exception as e:
-                                self.log_message.emit('err', f'  ✗ Lỗi in báo cáo: {e}')
+                                self._record_print_failure(fp, out_dir, e, keep_copy=False)
 
                 # ── Đánh dấu carrier hoàn thành ──
                 completed.add(carrier)
@@ -1090,10 +1096,14 @@ class AutomationWorker(QObject):
             # ── Tất cả carriers hoàn thành ──
             _nfail = getattr(self, 'failed_batches_total', 0)
             self.failed_batches_total = 0
+            _nunv = getattr(self, 'unverified_prints', 0)
+            self.unverified_prints = 0
             if _nfail:
-                self.log_message.emit('err', f'🏁 KẾT THÚC NHƯNG CÓ {_nfail} BATCH BỊ LỖI — KIỂM TRA LẠI ĐƠN CHƯA IN!')
+                self.log_message.emit('err', f'🏁 KẾT THÚC NHƯNG CÓ {_nfail} BATCH BỊ LỖI — KIỂM TRA LẠI ĐƠN CHƯA IN! (file lỗi in được giữ trong thư mục "chua_in")')
                 self.state_changed.emit('error', f'⚠ {_nfail} batch lỗi, còn đơn chưa in!')
             else:
+                if _nunv:
+                    self.log_message.emit('warn', f'⚠ Có {_nunv} lệnh in chưa xác nhận được trong hàng đợi — kiểm tra lại số tờ đã ra.')
                 self.log_message.emit('bold_ok', '🏁 HOÀN THÀNH!')
                 self.state_changed.emit('done', f'✅ Hoàn thành lúc {datetime.now().strftime("%H:%M:%S")}')
             try:
@@ -1123,6 +1133,24 @@ class AutomationWorker(QObject):
             self.job_completed.emit({})
         finally:
             self._running = False
+
+    def _record_print_failure(self, fp, out_dir, exc, keep_copy=True):
+        """In lỗi sau khi đã thử lại: ghi log đỏ, tính vào tổng lỗi, giữ file để in tay (thư mục chua_in)."""
+        self.failed_batches_total = getattr(self, 'failed_batches_total', 0) + 1
+        name = Path(fp).name
+        self.log_message.emit('err', f'  ✗ IN LỖI {name}: {exc}')
+        saved = list(getattr(exc, 'saved_paths', []) or [])
+        if keep_copy and not saved:
+            try:
+                d = Path(out_dir) / 'chua_in'
+                d.mkdir(parents=True, exist_ok=True)
+                dst = d / name
+                shutil.copy2(fp, dst)
+                saved.append(str(dst))
+            except Exception:
+                pass
+        for sp in saved:
+            self.log_message.emit('err', f'  📌 ĐƠN CHƯA IN — file giữ lại để in tay: {sp}')
 
     @Slot()
     def stop_job(self): self._stop_event.set()
@@ -1230,13 +1258,182 @@ def _check_print_errors(printer_name, doc_name_hint='', log_cb=None, timeout=60)
     return True
 
 
-def _wait_print_queue(printer_name, max_jobs=2, timeout=30, log_cb=None):
+class PrintFailed(RuntimeError):
+    """In thất bại sau khi đã thử lại. saved_paths: các file đã được giữ lại để in tay."""
+    def __init__(self, msg, saved_paths=None):
+        super().__init__(msg)
+        self.saved_paths = list(saved_paths or [])
+
+
+def _ps_quote(s):
+    return str(s).replace("'", "''")
+
+
+def _list_print_jobs(printer_name):
+    """Danh sách job trong hàng đợi máy in: [{Id, DocumentName, JobStatus, PagesPrinted, TotalPages, JobSize}].
+    Trả về None nếu không truy vấn được (khác với [] = hàng đợi trống)."""
+    import subprocess as _sp, json as _json
+    cmd = (f"Get-PrintJob -PrinterName '{_ps_quote(printer_name)}' -ErrorAction SilentlyContinue | "
+           "Select-Object Id,DocumentName,@{n='JobStatus';e={[string]$_.JobStatus}},PagesPrinted,TotalPages,JobSize | "
+           "ConvertTo-Json -Compress")
+    try:
+        r = _sp.run(['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', cmd],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=_sp.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+    except Exception:
+        return None
+    out = (r.stdout or '').strip()
+    if not out:
+        return [] if r.returncode == 0 else None
+    try:
+        data = _json.loads(out)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        data = [data]
+    return data if isinstance(data, list) else None
+
+
+def _printer_status(printer_name):
+    """Trạng thái máy in theo Windows (Normal / Offline / Paused / Error ...). '' nếu không đọc được."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
+                     f"[string](Get-Printer -Name '{_ps_quote(printer_name)}' -ErrorAction SilentlyContinue).PrinterStatus"],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=_sp.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+        return (r.stdout or '').strip()
+    except Exception:
+        return ''
+
+
+def _cancel_new_print_jobs(printer_name, before_ids):
+    """Xoá các job mới phát sinh (không có trong before_ids) để lần in lại không bị in trùng."""
+    import subprocess as _sp
+    for j in (_list_print_jobs(printer_name) or []):
+        jid = j.get('Id')
+        if jid is not None and jid not in before_ids:
+            try:
+                _sp.run(['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
+                         f"Remove-PrintJob -PrinterName '{_ps_quote(printer_name)}' -ID {int(jid)} -ErrorAction SilentlyContinue"],
+                        capture_output=True, timeout=30,
+                        creationflags=_sp.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            except Exception:
+                pass
+
+
+def _wait_job_finished(printer_name, before_ids, log_cb=None, stop_event=None,
+                       appear_timeout=30, stall_timeout=300, error_stall=90, poll=2):
+    """Theo dõi ĐÚNG job vừa gửi (job mới so với before_ids) cho tới khi rời hàng đợi.
+    Trả về 'ok' (đã thấy job và nó đã in xong) hoặc 'unverified' (không thấy job trong queue).
+    Raise RuntimeError nếu máy in lỗi / job bị huỷ / treo quá lâu / người dùng bấm Dừng.
+    Thời gian chờ tính theo tiến độ: chỉ tính là treo khi không có tiến triển trong stall_timeout giây."""
+    import time as _t
+    log = log_cb or (lambda m, t='': None)
+    t0 = _t.time()
+    my_ids = set()
+    last_sig, last_change = None, _t.time()
+    warned = set()
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError('Đã dừng trong lúc chờ in')
+        jobs = _list_print_jobs(printer_name)
+        if jobs is None:
+            # Không đọc được hàng đợi
+            if not my_ids and _t.time() - t0 > appear_timeout:
+                return 'unverified'
+            if my_ids and _t.time() - last_change > stall_timeout:
+                raise RuntimeError('Không đọc được hàng đợi máy in quá lâu')
+            _t.sleep(poll); continue
+        for j in jobs:
+            if j.get('Id') is not None and j.get('Id') not in before_ids:
+                my_ids.add(j.get('Id'))
+        mine = [j for j in jobs if j.get('Id') in my_ids]
+        if not mine:
+            if my_ids:
+                return 'ok'   # job đã thấy và đã rời hàng đợi, không có lỗi
+            if _t.time() - t0 > appear_timeout:
+                return 'unverified'
+            _t.sleep(1); continue
+
+        sig = tuple((j.get('Id'), j.get('JobStatus'), j.get('PagesPrinted'), j.get('JobSize')) for j in mine)
+        if sig != last_sig:
+            last_sig, last_change = sig, _t.time()
+        stalled = _t.time() - last_change
+        # Job đứng yên 20s: kiểm tra chính máy in (Offline / Paused / Error ...) — trạng thái job có thể vẫn "Normal"
+        if stalled > 20:
+            pst = _printer_status(printer_name)
+            if pst and pst not in ('Normal', 'Idle', 'Printing', 'Busy', 'Processing', 'WarmingUp', 'PowerSave', 'TonerLow'):
+                if ('printer', pst) not in warned:
+                    warned.add(('printer', pst))
+                    log(f'  ⚠ Máy in đang ở trạng thái "{pst}" — job không chạy được. Kiểm tra bật nguồn / kết nối mạng / nút tạm dừng của máy in.', 'err')
+                if stalled > error_stall:
+                    raise RuntimeError(f'Máy in không sẵn sàng: {pst}')
+        for j in mine:
+            st = str(j.get('JobStatus') or '')
+            if st and st not in warned:
+                warned.add(st)
+                log(f'  🖨️ Trạng thái job #{j.get("Id")}: {st} ({j.get("PagesPrinted")}/{j.get("TotalPages")} trang)', 'dim')
+            if 'Deleted' in st or 'Deleting' in st:
+                raise RuntimeError(f'Job in bị huỷ ({st})')
+            if any(k in st for k in ('Error', 'PaperJam', 'PaperOut', 'Offline', 'UserIntervention', 'DoorOpen', 'NoToner', 'Blocked')):
+                if ('err', st) not in warned:
+                    warned.add(('err', st))
+                    log(f'  ⚠ Máy in báo: {st} — kiểm tra máy in (giấy/kẹt giấy/mực/kết nối)', 'err')
+                if stalled > error_stall:
+                    raise RuntimeError(f'Máy in lỗi kéo dài: {st}')
+        if stalled > stall_timeout:
+            raise RuntimeError(f'Job in không có tiến triển trong {stall_timeout}s')
+        _t.sleep(poll)
+
+
+def _send_pdf_job(foxit_exe, part_path, printer_name, log_cb=None, stop_event=None, retries=2):
+    """Gửi 1 file PDF qua Foxit và đợi job in xong thật sự. Lỗi → xoá job dở, thử lại tối đa `retries` lần.
+    Trả về 'ok' hoặc 'unverified'. Hết lượt thử → raise RuntimeError."""
+    import subprocess, time as _t
+    log = log_cb or (lambda m, t='': None)
+    name = os.path.basename(part_path)
+    last_err = None
+    for attempt in range(1, retries + 2):
+        before_ids = set()
+        try:
+            log(f'  ⏳ Đợi hàng đợi máy in trống...', 'dim')
+            _wait_print_queue(printer_name, max_jobs=0, timeout=900, log_cb=log_cb,
+                              strict=True, stop_event=stop_event)
+            before_ids = {j.get('Id') for j in (_list_print_jobs(printer_name) or [])}
+            log(f'  ▶ Gửi lệnh in qua Foxit: {name}' + (f' (lần {attempt})' if attempt > 1 else ''), 'info')
+            result = subprocess.run([foxit_exe, '/t', part_path, printer_name], check=False, timeout=3600)
+            log(f'  ✓ Foxit đã thoát (exit code: {result.returncode})', 'dim')
+            if result.returncode != 0:
+                raise RuntimeError(f'Foxit exit code: {result.returncode}')
+            log(f'  🔍 Đang theo dõi job in...', 'dim')
+            state = _wait_job_finished(printer_name, before_ids, log_cb=log_cb, stop_event=stop_event)
+            if state == 'ok':
+                log(f'  ✅ Job in đã hoàn tất: {name}', 'ok')
+            else:
+                log(f'  ⚠ Không thấy job trong hàng đợi (Foxit exit 0) — chưa xác nhận được, hãy kiểm tra giấy ra: {name}', 'warn')
+            return state
+        except Exception as e:
+            last_err = e
+            if stop_event is not None and stop_event.is_set():
+                raise
+            _cancel_new_print_jobs(printer_name, before_ids)
+            if attempt <= retries:
+                log(f'  ⚠ In lỗi ({e}) — xoá job dở, thử lại {attempt}/{retries} sau 10s...', 'warn')
+                _t.sleep(10)
+    raise RuntimeError(f'{last_err}')
+
+
+def _wait_print_queue(printer_name, max_jobs=2, timeout=30, log_cb=None, strict=False, stop_event=None):
     """Đợi hàng đợi máy in ≤ max_jobs rồi mới gửi job mới (tránh quá tải RAM máy in).
-    timeout: số giây tối đa chờ (mặc định 30s)."""
+    timeout: số giây tối đa chờ (mặc định 30s).
+    strict=True: hết timeout mà hàng đợi vẫn còn job → raise RuntimeError thay vì in chồng lên."""
     import subprocess as _sp, time as _t
     deadline = _t.time() + timeout
     waited = False
     while _t.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError('Đã dừng trong lúc chờ hàng đợi máy in')
         result = _sp.run(['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
             f"@(Get-PrintJob -PrinterName '{printer_name}' -ErrorAction SilentlyContinue).Count"
         ], capture_output=True, text=True, creationflags=_sp.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
@@ -1256,13 +1453,18 @@ def _wait_print_queue(printer_name, max_jobs=2, timeout=30, log_cb=None):
             if log_cb: log_cb(msg, 'dim')
             else: print(msg)
         _t.sleep(1)  # kiểm tra mỗi 1 giây
+    if strict:
+        raise RuntimeError(f'Hàng đợi máy in vẫn còn job sau {timeout}s — không gửi chồng lên để tránh mất đơn')
     # Nếu hết timeout mà vẫn còn job → log cảnh báo và in tiếp (tránh treo vĩnh viễn)
     msg = f'   ⚠ Hết {timeout}s chờ — hàng đợi vẫn còn job, in tiếp...'
     if log_cb: log_cb(msg, 'warn')
     else: print(msg)
 
 
-def _print_file(file_path, printer_name, pdf_settings='paper=A4', log_cb=None, batch_size=0):
+def _print_file(file_path, printer_name, pdf_settings='paper=A4', log_cb=None, batch_size=0, stop_event=None):
+    """In file. PDF: gửi qua Foxit, đợi job in xong thật sự, tự thử lại khi lỗi.
+    Trả về 'ok' | 'unverified' (không xác nhận được job) | None (xlsx).
+    Lỗi cuối cùng → raise PrintFailed (saved_paths = các phần đã giữ lại trong thư mục chua_in)."""
     import subprocess, os as _os
     fp = str(file_path)
 
@@ -1297,58 +1499,60 @@ def _print_file(file_path, printer_name, pdf_settings='paper=A4', log_cb=None, b
                 reader = None
                 total_pages = 0
 
-            # ── Batch splitting ──
-            if batch_size > 0 and reader and total_pages > batch_size:
-                total_batches = (total_pages + batch_size - 1) // batch_size
-                if log_cb: log_cb(f'  📦 Foxit: Chia {total_pages} tờ → {total_batches} batch ({batch_size} tờ/batch)', 'info')
-                batch_num = 0
-                for start in range(0, total_pages, batch_size):
-                    batch_num += 1
-                    end = min(start + batch_size, total_pages)
-                    if log_cb: log_cb(f'  🖨️ Batch {batch_num}/{total_batches} (tờ {start+1}-{end})...', 'info')
-                    batch_writer = _PdfWriter()
-                    for i in range(start, end):
-                        batch_writer.add_page(reader.pages[i])
-                    batch_path = print_path + f'.batch{batch_num}.pdf'
-                    with open(batch_path, 'wb') as bf:
-                        batch_writer.write(bf)
-
-                    if log_cb: log_cb(f'  ⏳ Đợi hàng đợi máy in trống...', 'dim')
-                    _wait_print_queue(printer_name, max_jobs=0, log_cb=log_cb)
-                    if log_cb: log_cb(f'  ▶ Gửi lệnh in qua Foxit (batch {batch_num})...', 'info')
-                    cmd = [foxit_exe, '/t', batch_path, printer_name]
+            # ── Gửi in: chia batch (nếu cấu hình) hoặc 1 job. Mỗi job được theo dõi tới khi in xong thật ──
+            states = []
+            fail_msgs = []
+            saved_paths = []
+            chua_in_dir = Path(fp).parent / 'chua_in'
+            stop_set = lambda: stop_event is not None and stop_event.is_set()
+            try:
+                if batch_size > 0 and reader and total_pages > batch_size:
+                    total_batches = (total_pages + batch_size - 1) // batch_size
+                    if log_cb: log_cb(f'  📦 Foxit: Chia {total_pages} tờ → {total_batches} batch ({batch_size} tờ/batch)', 'info')
+                    batch_num = 0
+                    for start in range(0, total_pages, batch_size):
+                        batch_num += 1
+                        end = min(start + batch_size, total_pages)
+                        if log_cb: log_cb(f'  🖨️ Batch {batch_num}/{total_batches} (tờ {start+1}-{end})...', 'info')
+                        batch_writer = _PdfWriter()
+                        for i in range(start, end):
+                            batch_writer.add_page(reader.pages[i])
+                        batch_path = print_path + f'.batch{batch_num}.pdf'
+                        with open(batch_path, 'wb') as bf:
+                            batch_writer.write(bf)
+                        try:
+                            states.append(_send_pdf_job(foxit_exe, batch_path, printer_name,
+                                                        log_cb=log_cb, stop_event=stop_event))
+                        except Exception as e:
+                            if stop_set(): raise
+                            fail_msgs.append(f'batch {batch_num}/{total_batches} (tờ {start+1}-{end}): {e}')
+                            if log_cb: log_cb(f'  ✗ Batch {batch_num}/{total_batches} IN LỖI: {e}', 'err')
+                            try:
+                                chua_in_dir.mkdir(parents=True, exist_ok=True)
+                                keep = chua_in_dir / f'{Path(fp).stem}_batch{batch_num}.pdf'
+                                shutil.copy2(batch_path, keep)
+                                saved_paths.append(str(keep))
+                            except Exception:
+                                pass
+                        finally:
+                            try: _os.remove(batch_path)
+                            except Exception: pass
+                else:
                     try:
-                        result = subprocess.run(cmd, check=False, timeout=3600)
-                        if log_cb: log_cb(f'  ✓ Foxit batch {batch_num} đã thoát (exit code: {result.returncode})', 'dim')
-                        if result.returncode != 0:
-                            raise RuntimeError(f'Foxit batch {batch_num} exit code: {result.returncode}')
-                        if log_cb: log_cb(f'  🔍 Đang kiểm tra trạng thái in batch {batch_num}...', 'dim')
-                        _check_print_errors(printer_name, doc_name_hint=os.path.basename(batch_path), log_cb=log_cb)
-                        if log_cb: log_cb(f'  ✅ Batch {batch_num}/{total_batches} đã in xong', 'ok')
-                    finally:
-                        try: _os.remove(batch_path)
+                        states.append(_send_pdf_job(foxit_exe, print_path, printer_name,
+                                                    log_cb=log_cb, stop_event=stop_event))
+                    except Exception as e:
+                        if stop_set(): raise
+                        fail_msgs.append(str(e))
+            finally:
+                if temp_merged:
+                    def _cleanup(p=temp_merged):
+                        try: _os.remove(p)
                         except Exception: pass
-
-            else:
-                # ── In thẳng không batch ──
-                if log_cb: log_cb(f'  ⏳ Đợi hàng đợi máy in trống (max_jobs=0)...', 'dim')
-                _wait_print_queue(printer_name, max_jobs=0, log_cb=log_cb)
-                if log_cb: log_cb(f'  ▶ Gửi lệnh in qua Foxit: {os.path.basename(print_path)}', 'info')
-                cmd = [foxit_exe, '/t', print_path, printer_name]
-                result = subprocess.run(cmd, check=False, timeout=3600)
-                if log_cb: log_cb(f'  ✓ Foxit đã thoát (exit code: {result.returncode})', 'dim')
-                if result.returncode != 0:
-                    raise RuntimeError(f'Foxit exit code: {result.returncode}')
-                if log_cb: log_cb(f'  🔍 Đang kiểm tra trạng thái in...', 'dim')
-                _check_print_errors(printer_name, doc_name_hint=os.path.basename(print_path), log_cb=log_cb)
-                if log_cb: log_cb(f'  ✅ In hoàn tất', 'ok')
-            if temp_merged:
-                def _cleanup(p=temp_merged):
-                    import time; time.sleep(5)
-                    try: _os.remove(p)
-                    except Exception: pass
-                threading.Timer(5, _cleanup).start()
-            return
+                    threading.Timer(30, _cleanup).start()
+            if fail_msgs:
+                raise PrintFailed('; '.join(fail_msgs), saved_paths)
+            return 'unverified' if 'unverified' in states else 'ok'
 
         if fp.lower().endswith('.xlsx') or fp.lower().endswith('.xls'):
             import pythoncom, win32com.client, time as _t_excel
